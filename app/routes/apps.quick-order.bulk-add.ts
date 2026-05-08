@@ -55,6 +55,7 @@ const addLinesMutation = `#graphql
       warnings {
         code
         message
+        target
       }
     }
   }
@@ -159,12 +160,45 @@ async function ensureCart(
   }
 }
 
+type CartUserError = {
+  field?: string[] | null;
+  message: string;
+};
+
+type CartWarning = {
+  code: string;
+  message: string;
+  target?: string | null;
+};
+
+type LineAddBatchResult = {
+  ok: boolean;
+  cart: CartSummary | null;
+  // Per-line failures keyed by line index in the batch (not by merchandiseId
+  // because the same merchandise can appear in multiple lines). Used by the
+  // caller to mark individual lines as failed without failing the whole
+  // batch. Falls back to `error` (string) for transport errors.
+  perLineFailures: Map<number, string>;
+  // Warnings keyed by merchandiseId so we can attach them to the right line
+  // even though Shopify's warnings don't directly reference line indexes.
+  warningsByMerchandise: Map<string, string[]>;
+  // Bulk transport / network error for the entire batch.
+  batchError: string | null;
+};
+
+function indexFromUserErrorField(field: string[] | null | undefined): number | null {
+  // Field paths look like: ["lines", "3", "quantity"] or ["lines", "0"]
+  if (!Array.isArray(field) || field.length < 2 || field[0] !== "lines") return null;
+  const idx = Number(field[1]);
+  return Number.isFinite(idx) ? idx : null;
+}
+
 async function cartLinesAddWithRetry(
   storefront: StorefrontClient,
   cartId: string,
   lines: IncomingLine[],
-) {
-  let lastError: string | null = null;
+): Promise<LineAddBatchResult> {
+  let batchError: string | null = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -175,19 +209,53 @@ async function cartLinesAddWithRetry(
       const payload = body?.data?.cartLinesAdd;
 
       if (!payload) {
-        const message = body?.errors?.[0]?.message || "Unknown Storefront API error";
-        lastError = message;
-      } else if ((payload.userErrors || []).length > 0) {
-        lastError = payload.userErrors
-          .map((e: { message: string }) => e.message)
-          .join("; ");
-        // userErrors are validation failures; retry rarely helps. Bail out.
-        return { ok: false, error: lastError, cart: payload.cart || null };
+        batchError = body?.errors?.[0]?.message || "Unknown Storefront API error";
       } else {
-        return { ok: true, cart: payload.cart || null };
+        const perLineFailures = new Map<number, string>();
+        const warningsByMerchandise = new Map<string, string[]>();
+
+        // Map userErrors back to specific line indexes when possible.
+        (payload.userErrors || []).forEach((err: CartUserError) => {
+          const idx = indexFromUserErrorField(err.field);
+          if (idx !== null && idx >= 0 && idx < lines.length) {
+            const existing = perLineFailures.get(idx);
+            perLineFailures.set(
+              idx,
+              existing ? `${existing}; ${err.message}` : err.message,
+            );
+          } else {
+            // Unattributable userError: treat as full-batch failure.
+            batchError = batchError
+              ? `${batchError}; ${err.message}`
+              : err.message;
+          }
+        });
+
+        // Warnings attach to a specific merchandiseId.
+        (payload.warnings || []).forEach((warning: CartWarning) => {
+          const target = warning.target || "";
+          const list = warningsByMerchandise.get(target) || [];
+          list.push(`${warning.code}: ${warning.message}`);
+          warningsByMerchandise.set(target, list);
+        });
+
+        // If we have an unattributable batch error and zero per-line errors
+        // mapped, retry. Otherwise we have actionable info and should return.
+        if (batchError && perLineFailures.size === 0 && attempt < MAX_RETRIES) {
+          await sleep(RETRY_BASE_MS * (attempt + 1));
+          continue;
+        }
+
+        return {
+          ok: perLineFailures.size === 0 && !batchError,
+          cart: (payload.cart as CartSummary) || null,
+          perLineFailures,
+          warningsByMerchandise,
+          batchError,
+        };
       }
     } catch (error) {
-      lastError = error instanceof Error ? error.message : "Request failed";
+      batchError = error instanceof Error ? error.message : "Request failed";
     }
 
     if (attempt < MAX_RETRIES) {
@@ -195,7 +263,13 @@ async function cartLinesAddWithRetry(
     }
   }
 
-  return { ok: false, error: lastError || "Unable to add lines", cart: null };
+  return {
+    ok: false,
+    cart: null,
+    perLineFailures: new Map(),
+    warningsByMerchandise: new Map(),
+    batchError: batchError || "Unable to add lines",
+  };
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -286,37 +360,93 @@ export async function action({ request }: ActionFunctionArgs) {
     const failed: FailedLine[] = [];
     let addedCount = 0;
     let lastCart: CartSummary = ensuredCart;
+    const expectedTotalQuantity = normalizedLines.reduce(
+      (sum, line) => sum + line.quantity,
+      0,
+    );
 
     const batches = chunk(normalizedLines, MAX_LINES_PER_CALL);
     for (const batch of batches) {
       const result = await cartLinesAddWithRetry(storefront, cartId, batch);
-      if (result.ok) {
-        addedCount += batch.length;
-        if (result.cart) lastCart = result.cart;
-        continue;
-      }
+      if (result.cart) lastCart = result.cart;
 
-      console.warn(
-        `[bulk-add] batch of ${batch.length} lines failed:`,
-        result.error,
-      );
+      // Successful lines: anything in the batch that didn't get a per-line
+      // failure AND didn't get a warning that effectively rejected it.
+      batch.forEach((line, lineIdx) => {
+        const perLineError = result.perLineFailures.get(lineIdx);
+        const warnings = result.warningsByMerchandise.get(line.merchandiseId);
 
-      batch.forEach((line) => {
-        failed.push({
-          merchandiseId: line.merchandiseId,
-          quantity: line.quantity,
-          reason: result.error || "Batch failed",
-        });
+        if (perLineError) {
+          failed.push({
+            merchandiseId: line.merchandiseId,
+            quantity: line.quantity,
+            reason: perLineError,
+          });
+          return;
+        }
+
+        if (result.batchError) {
+          failed.push({
+            merchandiseId: line.merchandiseId,
+            quantity: line.quantity,
+            reason: result.batchError,
+          });
+          return;
+        }
+
+        if (warnings && warnings.length > 0) {
+          // Warnings attach to specific merchandise. Surface as failures so
+          // the frontend re-validates rather than silently navigating to a
+          // checkout that's missing items.
+          failed.push({
+            merchandiseId: line.merchandiseId,
+            quantity: line.quantity,
+            reason: warnings.join("; "),
+          });
+          return;
+        }
+
+        addedCount++;
       });
+
+      if (result.batchError) {
+        console.warn(
+          `[bulk-add] batch of ${batch.length} lines failed transport:`,
+          result.batchError,
+        );
+      }
     }
 
+    // Final consistency check: did the cart really end up with what we
+    // requested? If totalQuantity is short of the expected total, Shopify
+    // silently truncated something - report it so the frontend doesn't push
+    // the user into a checkout with missing/incorrect items.
+    let truncationWarning: string | null = null;
+    const actualTotal =
+      typeof lastCart?.totalQuantity === "number" ? lastCart.totalQuantity : null;
+    if (
+      actualTotal !== null &&
+      failed.length === 0 &&
+      actualTotal < expectedTotalQuantity
+    ) {
+      truncationWarning = `Cart total quantity is ${actualTotal} but ${expectedTotalQuantity} was requested. Some quantities were silently reduced by Shopify (likely stock or B2B catalog rules).`;
+      console.warn(`[bulk-add] ${truncationWarning}`);
+    }
+
+    console.log(
+      `[bulk-add] done. requested=${normalizedLines.length} added=${addedCount} failed=${failed.length} expectedTotalQty=${expectedTotalQuantity} actualTotalQty=${actualTotal}`,
+    );
+
     return json({
-      ok: failed.length === 0,
+      ok: failed.length === 0 && !truncationWarning,
       cartCreated: created,
       cartId,
       addedCount,
       failedCount: failed.length,
       totalCount: normalizedLines.length,
+      expectedTotalQuantity,
+      actualTotalQuantity: actualTotal,
+      truncationWarning,
       failed,
       cart: lastCart,
     });
