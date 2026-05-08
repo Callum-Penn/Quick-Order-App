@@ -2,7 +2,7 @@
 
 client_id = "b0fec0bccb2fbbab1070dd306b9f6154"
 name = "Quick Order"
-application_url = "https://example.com"
+application_url = "https://quick-order-cdvgl.ondigitalocean.app/"
 embedded = true
 
 [build]
@@ -28,10 +28,10 @@ api_version = "2026-07"
 scopes = "write_products,write_metaobjects,write_metaobject_definitions,unauthenticated_read_product_listings,unauthenticated_read_product_inventory,unauthenticated_write_checkouts"
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://quick-order-cdvgl.ondigitalocean.app/api/auth" ]
 
 [app_proxy]
-url = "https://example.com/apps/quick-order"
+url = "https://quick-order-cdvgl.ondigitalocean.app/apps/quick-order"
 subpath = "quick-order"
 prefix = "apps"
 
